@@ -8,6 +8,7 @@ Strictly adheres to docs/API_CONTRACT.md and .agents/rules/10-backend.md.
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -16,9 +17,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from backend.agent import AnalysisResult, analyze_incident
+from backend.agent import AnalysisResult, analyze_incident, check_groq
 from backend.memory import (
     MemoryServiceError,
+    check_hindsight,
     get_memory_stats,
     load_local_incidents,
     store_incident,
@@ -33,13 +35,21 @@ logger = logging.getLogger("recallops.api")
 app = FastAPI(
     title="RecallOps API",
     description="Incident-intelligence AI agent backend with persistent Hindsight memory and Groq LLM reasoning.",
-    version="1.0.0",
+    version="1.1.0",
 )
 
-# CORS: Allow only http://localhost:3000 per rule 10-backend.md
+# CORS: allow http://localhost:3000 and optional configured origins from env, never "*" per rule 10-backend.md
+cors_env = os.getenv("CORS_ORIGINS", "")
+allowed_origins = ["http://localhost:3000"]
+if cors_env:
+    for origin in cors_env.split(","):
+        cleaned = origin.strip()
+        if cleaned and cleaned != "*":
+            allowed_origins.append(cleaned)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -49,16 +59,16 @@ app.add_middleware(
 # Exception handler for clean 502 errors on upstream failures
 @app.exception_handler(MemoryServiceError)
 async def memory_service_exception_handler(request: Request, exc: MemoryServiceError):
-    logger.error("Upstream memory error: %s", exc)
+    logger.error("Upstream memory error: %s", type(exc).__name__)
     return JSONResponse(
         status_code=status.HTTP_502_BAD_GATEWAY,
-        content={"success": False, "error": f"Upstream memory service error: {exc}"},
+        content={"success": False, "error": f"Upstream memory service error: {type(exc).__name__}"},
     )
 
 
 @app.exception_handler(Exception)
 async def generic_exception_handler(request: Request, exc: Exception):
-    logger.error("Unhandled error: %s", exc)
+    logger.error("Unhandled error: %s", type(exc).__name__)
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={"success": False, "error": f"Internal server error: {type(exc).__name__}"},
@@ -74,6 +84,13 @@ class HealthResponse(BaseModel):
     status: str = "ok"
     service: str = "recallops-backend"
     timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class DeepHealthResponse(BaseModel):
+    status: str
+    groq: Dict[str, Any]
+    hindsight: Dict[str, Any]
+    local_incidents: int
 
 
 class AnalyzeRequest(BaseModel):
@@ -92,7 +109,7 @@ class AnalyzeResponse(BaseModel):
 
 class AttemptItem(BaseModel):
     action: str = Field(..., min_length=1, description="Action taken")
-    result: str = Field(..., description="Outcome: FAILED, SUCCESS, or PARTIAL")
+    result: str = Field(..., description="Outcome: FAILED, SUCCESS, PARTIAL, or UNKNOWN")
 
 
 class RecordRequest(BaseModel):
@@ -106,6 +123,9 @@ class RecordRequest(BaseModel):
     root_cause: str = Field(..., min_length=1, description="Confirmed root cause")
     resolution: str = Field(..., min_length=1, description="Confirmed resolution")
     outcome: Optional[str] = Field("RESOLVED", description="Final incident outcome")
+    ai_recommended_action: Optional[str] = Field(None, description="AI recommended action")
+    actual_action: Optional[str] = Field(None, description="Actual remediation action executed")
+    failure_reason: Optional[str] = Field(None, description="Optional failure reason")
 
 
 class RecordResponse(BaseModel):
@@ -131,6 +151,12 @@ class SeedResponse(BaseModel):
     results: List[str]
 
 
+class IncidentListResponse(BaseModel):
+    success: bool = True
+    incidents: List[Dict[str, Any]]
+    total: int
+
+
 # ------------------------------------------------------------------------------
 # API Endpoints
 # ------------------------------------------------------------------------------
@@ -142,6 +168,25 @@ def health_check():
     return HealthResponse()
 
 
+@app.get("/health/deep", response_model=DeepHealthResponse)
+def deep_health_check():
+    """Deep health check: probe Groq and Hindsight connectivity."""
+    groq_status = check_groq()
+    hindsight_status = check_hindsight()
+    local_count = len(load_local_incidents())
+
+    overall = "ok"
+    if not groq_status.get("ok") or not hindsight_status.get("ok"):
+        overall = "degraded"
+
+    return DeepHealthResponse(
+        status=overall,
+        groq=groq_status,
+        hindsight=hindsight_status,
+        local_incidents=local_count,
+    )
+
+
 @app.post("/analyze", response_model=AnalyzeResponse)
 def analyze_endpoint(payload: AnalyzeRequest):
     """Analyze an incoming incident against recalled memory with Groq reasoning."""
@@ -151,13 +196,15 @@ def analyze_endpoint(payload: AnalyzeRequest):
             symptoms=payload.symptoms,
             description=payload.description,
             logs=payload.logs,
+            environment=payload.environment,
+            severity=payload.severity,
         )
         return AnalyzeResponse(success=True, analysis=AnalysisResult(**analysis_data))
     except Exception as exc:
-        logger.error("Analysis failure: %s", exc)
+        logger.error("Analysis failure: %s", type(exc).__name__)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Upstream reasoning failure: {type(exc).__name__}: {exc}",
+            detail=f"Upstream reasoning failure: {type(exc).__name__}",
         ) from exc
 
 
@@ -174,10 +221,10 @@ def record_endpoint(payload: RecordRequest):
             hindsight_response=result.get("hindsight"),
         )
     except Exception as exc:
-        logger.error("Record persistence failure: %s", exc)
+        logger.error("Record persistence failure: %s", type(exc).__name__)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Upstream memory persistence failure: {type(exc).__name__}: {exc}",
+            detail=f"Upstream memory persistence failure: {type(exc).__name__}",
         ) from exc
 
 
@@ -188,10 +235,10 @@ def memory_stats_endpoint():
         stats = get_memory_stats()
         return MemoryStatsResponse(success=True, stats=stats)
     except Exception as exc:
-        logger.error("Memory stats failure: %s", exc)
+        logger.error("Memory stats failure: %s", type(exc).__name__)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Failed to retrieve memory statistics: {type(exc).__name__}: {exc}",
+            detail=f"Failed to retrieve memory statistics: {type(exc).__name__}",
         ) from exc
 
 
@@ -202,10 +249,10 @@ def memory_patterns_endpoint():
         patterns = summarize_learned_patterns()
         return MemoryPatternsResponse(success=True, patterns=patterns)
     except Exception as exc:
-        logger.error("Pattern reflection failure: %s", exc)
+        logger.error("Pattern reflection failure: %s", type(exc).__name__)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Failed to synthesize memory patterns: {type(exc).__name__}: {exc}",
+            detail=f"Failed to synthesize memory patterns: {type(exc).__name__}",
         ) from exc
 
 
@@ -224,8 +271,27 @@ def seed_endpoint():
 
         return SeedResponse(success=True, seeded=len(seeded_ids), results=seeded_ids)
     except Exception as exc:
-        logger.error("Seed failure: %s", exc)
+        logger.error("Seed failure: %s", type(exc).__name__)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Failed to seed memory records: {type(exc).__name__}: {exc}",
+            detail=f"Failed to seed memory records: {type(exc).__name__}",
         ) from exc
+
+
+@app.get("/incidents", response_model=IncidentListResponse)
+def list_incidents_endpoint():
+    """List all locally stored incidents for the history view."""
+    try:
+        incidents = load_local_incidents()
+        return IncidentListResponse(
+            success=True,
+            incidents=incidents,
+            total=len(incidents),
+        )
+    except Exception as exc:
+        logger.error("List incidents failure: %s", type(exc).__name__)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Failed to list incidents: {type(exc).__name__}",
+        ) from exc
+
